@@ -19,33 +19,58 @@ fn qvd(_py: Python, m: &PyModule) -> PyResult<()> {
 }
 
 #[pyfunction]
-fn read_qvd(py: Python, file_name: String) -> PyResult<Py<PyDict>> {
+fn read_qvd(py: Python, file_name: String, chunk_size: Option<usize>) -> PyResult<Py<PyDict>> {
     let xml: String = get_xml_data(&file_name).expect("Error reading file");
     let dict = PyDict::new(py);
     let binary_section_offset = xml.as_bytes().len();
-
     let qvd_structure: QvdTableHeader = from_str(&xml).unwrap();
     let mut symbol_map: HashMap<String, Vec<Option<String>>> = HashMap::new();
 
     if let Ok(f) = File::open(&file_name) {
         // Seek to the end of the XML section
         let buf = read_qvd_to_buf(f, binary_section_offset);
-        let rows_start = qvd_structure.offset;
-        let rows_end = buf.len();
-        let rows_section = &buf[rows_start..rows_end];
         let record_byte_size = qvd_structure.record_byte_size;
+        let num_records = (buf.len() - qvd_structure.offset) / record_byte_size;
 
         for field in qvd_structure.fields.headers {
             symbol_map.insert(
                 field.field_name.clone(),
                 get_symbols_as_strings(&buf, &field),
             );
-            let symbol_indexes = get_row_indexes(&rows_section, &field, record_byte_size);
-            let column_values =
-                match_symbols_with_indexes(&symbol_map[&field.field_name], &symbol_indexes);
-            dict.set_item(field.field_name, column_values).unwrap();
+
+            let column_values = if let Some(chunk_size) = chunk_size {
+                // Process in chunks
+                let mut start_index = 0;
+                let mut end_index = 0;
+                let mut chunk_column_values = vec![];
+
+                while end_index < num_records {
+                    end_index = start_index + chunk_size;
+                    if end_index > num_records {
+                        end_index = num_records;
+                    }
+
+                    let chunk_section = &buf[qvd_structure.offset + start_index * record_byte_size..qvd_structure.offset + end_index * record_byte_size];
+                    let symbol_indexes = get_row_indexes(&chunk_section, &field, record_byte_size);
+                    let chunk_column_values_part = match_symbols_with_indexes(&symbol_map[&field.field_name], &symbol_indexes);
+
+                    chunk_column_values.extend(chunk_column_values_part);
+                    start_index = end_index;
+                }
+
+                chunk_column_values
+            } else {
+                // Process entire file
+                let chunk_section = &buf[qvd_structure.offset..];
+                let symbol_indexes = get_row_indexes(&chunk_section, &field, record_byte_size);
+                match_symbols_with_indexes(&symbol_map[&field.field_name], &symbol_indexes)
+            };
+
+            // Store column values in the dictionary
+            dict.get_item_mut(field.field_name).unwrap().extend(column_values);
         }
     }
+
     Ok(dict.into())
 }
 
